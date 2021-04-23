@@ -89,7 +89,8 @@ class DiscreteVAE(nn.Module):
         self.num_layers = num_layers
         self.temperature = temperature
         self.straight_through = straight_through
-        self.codebook = nn.Embedding(num_tokens, codebook_dim)
+        self.codebook = nn.Embedding(num_tokens, codebook_dim) # (8192, 512)
+        # nn.Embedding(value_range(index_value), embedding_dim)
 
         hdim = hidden_dim
 
@@ -129,7 +130,7 @@ class DiscreteVAE(nn.Module):
     @torch.no_grad()
     @eval_decorator
     def get_codebook_indices(self, images):
-        logits = self.forward(images, return_logits = True)
+        logits = self.forward(images, return_logits = True) # (bs, 8192, 1024)
         codebook_indices = logits.argmax(dim = 1).flatten(1)
         return codebook_indices
 
@@ -137,12 +138,13 @@ class DiscreteVAE(nn.Module):
         self,
         img_seq
     ):
-        image_embeds = self.codebook(img_seq)
+        # img_seq = (bs, -1024:)
+        image_embeds = self.codebook(img_seq) # (bs, 1024, 512)
         b, n, d = image_embeds.shape
         h = w = int(sqrt(n))
 
         image_embeds = rearrange(image_embeds, 'b (h w) d -> b d h w', h = h, w = w)
-        images = self.decoder(image_embeds)
+        images = self.decoder(image_embeds) # (bs, 512, 32, 32) --> (bs, 3, 128, 128)
         return images
 
     def forward(
@@ -156,7 +158,7 @@ class DiscreteVAE(nn.Module):
         device, num_tokens, image_size, kl_div_loss_weight = img.device, self.num_tokens, self.image_size, self.kl_div_loss_weight
         assert img.shape[-1] == image_size and img.shape[-2] == image_size, f'input must have the correct image size {image_size}'
 
-        logits = self.encoder(img)
+        logits = self.encoder(img) # (bs, 8192, 1024)
 
         if return_logits:
             return logits # return logits for getting hard image indices for DALL-E training
@@ -294,8 +296,8 @@ class DALLE(nn.Module):
         image_fmap_size = (vae.image_size // (2 ** vae.num_layers))
         image_seq_len = image_fmap_size ** 2
 
-        self.text_emb = nn.Embedding(num_text_tokens, dim)
-        self.image_emb = nn.Embedding(num_image_tokens, dim)
+        self.text_emb = nn.Embedding(num_text_tokens, dim) # (49408 --> 512)
+        self.image_emb = nn.Embedding(num_image_tokens, dim) # (8192 --> 512 )
 
         self.text_pos_emb = nn.Embedding(text_seq_len + 1, dim) # +1 for <bos>
         self.image_pos_emb = AxialPositionalEmbedding(dim, axial_shape = (image_fmap_size, image_fmap_size))
@@ -357,32 +359,35 @@ class DALLE(nn.Module):
         filter_thres = 0.5,
         temperature = 1.
     ):
+        
+        # text_seq_len=256, text_tokens=49408
+        # image_seq_len=1024, image_tokens=8192
         vae, text_seq_len, image_seq_len, num_text_tokens = self.vae, self.text_seq_len, self.image_seq_len, self.num_text_tokens
-        total_len = text_seq_len + image_seq_len
+        total_len = text_seq_len + image_seq_len # 256 + 1024 = 1280
 
-        out = text
+        out = text # (bs, 256)
 
         for cur_len in range(text.shape[1], total_len):
             is_image = cur_len >= text_seq_len
 
-            text, image = out[:, :text_seq_len], out[:, text_seq_len:] # 
+            text, image = out[:, :text_seq_len], out[:, text_seq_len:] # (bs, :256) (bs, 256:)
 
-            logits = self(text, image, mask = mask)[:, -1, :]
+            logits = self(text, image, mask = mask)[:, -1, :] # (bs, 257, 8192) --> (bs, 1280, 57600) --> (bs, 57600)
 
             filtered_logits = top_k(logits, thres = filter_thres)
-            probs = F.softmax(filtered_logits / temperature, dim = -1)
-            sample = torch.multinomial(probs, 1)
+            probs = F.softmax(filtered_logits / temperature, dim = -1) # (bs, 57600)
+            sample = torch.multinomial(probs, 1) # (bs, 1)
 
             sample -= (num_text_tokens if is_image else 0) # offset sampled token if it is an image token, since logit space is composed of text and then image tokens
-            out = torch.cat((out, sample), dim=-1)
+            out = torch.cat((out, sample), dim=-1) # 1개씩 점차 증가: (bs, 256) --> (bs, 1280)
 
             if out.shape[1] <= text_seq_len:
                 mask = F.pad(mask, (0, 1), value = True)
 
-        text_seq = out[:, :text_seq_len]
+        text_seq = out[:, :text_seq_len] # (bs, 256)
 
-        img_seq = out[:, -image_seq_len:]
-        images = vae.decode(img_seq)
+        img_seq = out[:, -image_seq_len:] # (bs, -1024:)
+        images = vae.decode(img_seq) # (bs, 3, 256, 256)
 
         if exists(clip):
             scores = clip(text_seq, images, return_loss = False)
@@ -398,30 +403,30 @@ class DALLE(nn.Module):
         return_loss = False
     ):
         assert text.shape[-1] == self.text_seq_len, f'the length {text.shape[-1]} of the text tokens you passed in does not have the correct length ({self.text_seq_len})'
-        device, total_seq_len = text.device, self.total_seq_len
+        device, total_seq_len = text.device, self.total_seq_len # text, 1280
 
-        text = F.pad(text, (1, 0), value = 0) # use padding as <bos>
+        text = F.pad(text, (1, 0), value = 0) # use padding as <bos> # (bs, 257)
 
         if exists(mask):
             mask = F.pad(mask, (1, 0), value = True)
 
-        tokens = self.text_emb(text)
+        tokens = self.text_emb(text) # (bs, 257, 512)
         tokens += self.text_pos_emb(torch.arange(text.shape[1], device = device))
 
-        seq_len = tokens.shape[1]
+        seq_len = tokens.shape[1] # 257
 
         if exists(image) and not is_empty(image):
             is_raw_image = len(image.shape) == 4
 
             if is_raw_image:
-                image = self.vae.get_codebook_indices(image)
+                image = self.vae.get_codebook_indices(image) # (bs, 1024)
 
-            image_len = image.shape[1]
-            image_emb = self.image_emb(image)
+            image_len = image.shape[1] # 1024
+            image_emb = self.image_emb(image) # (bs, 1024, 512)
 
             image_emb += self.image_pos_emb(image_emb)
 
-            tokens = torch.cat((tokens, image_emb), dim = 1)
+            tokens = torch.cat((tokens, image_emb), dim = 1) # (bs, 257, 1024)+(bs, 1024, 512) = (bs, 1281, 512)
 
             seq_len += image_len
             if exists(mask):
@@ -431,13 +436,13 @@ class DALLE(nn.Module):
         # remove the last token, since it needs not to be trained
         if tokens.shape[1] > total_seq_len:
             seq_len -= 1
-            tokens = tokens[:, :-1]
+            tokens = tokens[:, :-1] # (bs, 1280, 512)
 
             if exists(mask):
-                mask = mask[:, :-1]
+                mask = mask[:, :-1] # (bs, 1280, 512)
 
-        out = self.transformer(tokens, mask = mask)
-        logits = self.to_logits(out)
+        out = self.transformer(tokens, mask = mask) # (bs, 1280, 512)
+        logits = self.to_logits(out) # (bs, 1280, 57600) <-- (8192 + 49408)
 
         # mask logits to make sure text predicts text (except last token), and image predicts image
         logits_mask = self.logits_mask[:, :seq_len]
