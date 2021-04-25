@@ -1,1 +1,1 @@
-# Dalle
+# Dalle + StyleCLIP
